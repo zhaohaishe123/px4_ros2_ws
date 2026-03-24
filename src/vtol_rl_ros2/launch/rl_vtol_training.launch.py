@@ -24,9 +24,11 @@ def generate_launch_description():
         # 3. 启动 Python 强化学习训练节点
         Node(
             package='vtol_rl_ros2',
-            executable='ppo_train_node.py', # 确保你的 setup.py 中配置了这个名字
+            executable='ppo_train_node.py', 
             name='ppo_train_node',
             output='screen',
-            emulate_tty=True
+            emulate_tty=True,
+            # [新增] 强制 Python 实时输出，不进行缓冲
+            additional_env={'PYTHONUNBUFFERED': '1'} 
         )
     ])

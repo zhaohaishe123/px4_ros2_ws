@@ -54,7 +54,35 @@ class VtolRlEnv(gym.Env):
     def _spin_once(self): rclpy.spin_once(self.node, timeout_sec=0.01)
 
     def step(self, action):
-        # 1. 动作平滑 (完全复刻)
+        # ================= [新增] 飞行姿态安全保护罩 (Attitude Safety Guard) =================
+        # 1. 获取当前真实的 Roll 和 Pitch 姿态角
+        w, x, y, z = self.att.q[0], self.att.q[1], self.att.q[2], self.att.q[3]
+        roll = math.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
+        pitch = math.asin(2.0 * (w * y - z * x))
+
+        # 2. 定义安全边界 (弧度)
+        SAFE_PITCH = 0.5  # 约 28 度 (防止严重抬机头/大角度俯冲)
+        SAFE_ROLL  = 0.8  # 约 45 度 (防止过度倾斜导致掉高甚至翻滚)
+
+        # 3. 拦截危险指令：如果已经在危险边缘，且 RL 动作还要继续加剧倾斜，则强行切断该方向指令
+        if (pitch > SAFE_PITCH and action[1] > 0.0) or (pitch < -SAFE_PITCH and action[1] < 0.0):
+            action[1] = 0.0
+        if (roll > SAFE_ROLL and action[2] > 0.0) or (roll < -SAFE_ROLL and action[2] < 0.0):
+            action[2] = 0.0
+
+        # 4. 强力改平辅助：如果由于惯性越过了极限安全线，脱离 RL 控制，直接施加反向恢复力矩
+        if pitch > SAFE_PITCH + 0.1:
+            action[1] = -0.6  # 强制压机头
+        elif pitch < -(SAFE_PITCH + 0.1):
+            action[1] = 0.6   # 强制拉机头
+
+        if roll > SAFE_ROLL + 0.1:
+            action[2] = -0.8  # 强制反向横滚改平
+        elif roll < -(SAFE_ROLL + 0.1):
+            action[2] = 0.8
+        # =================================================================================
+
+        # 动作平滑 (融入了安全修正后的 action)
         tau = 0.4
         smoothed_action = (1.0 - tau) * self.prev_action + tau * action
         smoothed_action = np.clip(smoothed_action, -1.0, 1.0)
@@ -161,46 +189,60 @@ class VtolRlEnv(gym.Env):
         return obs
 
     def _compute_reward_and_done(self, obs, action):
-        """复刻 Eq.22 奖励函数与生存保底"""
-        Va, roll, pitch, delta_yaw = obs[0]*10.0+20.0, obs[1]*1.57, obs[2]*1.0, obs[3]*3.14
-        p, q_rate, r = obs[4]*2.0, obs[5]*2.0, obs[6]*2.0
+        """优化版奖励函数：强化平滑性约束与震荡抑制"""
+        # 解包状态 (按照 _get_obs 的组装顺序)
+        # Va[0], roll[1], pitch[2], delta_yaw[3], p[4], q[5], r[6]
+        Va = obs[0] * 10.0 + 20.0
+        roll = obs[1] * 1.57
+        pitch = obs[2] * 1.0
+        delta_yaw = obs[3] * 3.14
+        p, q_rate, r = obs[4] * 2.0, obs[5] * 2.0, obs[6] * 2.0
+        
+        # 垂直速度 (从 local_pos 获取，用于抑制震荡)
+        vz = self.local_pos.vz 
         current_alt = -self.local_pos.z
         
+        # 计算误差
         Va_e = self.target_speed - Va
         pitch_e = self.target_pitch - pitch
         roll_e = self.target_roll - roll
         alt_e = self.target_altitude - current_alt
 
+        # 动作变化率 (惩罚抖动)
         action_rate = action - self.prev_action 
-        pqr_rate = np.array([p, q_rate, r]) - self.prev_pqr 
 
-        # --- Longitudinal Cost ---
-        long_cost = (1.0 * abs(Va_e) + 5.0 * abs(pitch_e) + 0.5 * abs(q_rate) + 1.0 * abs(alt_e))
-        long_cost += np.clip(0.5 * abs(action_rate[0]), 0.0, 0.5) 
-        long_cost += np.clip(1.0 * abs(action_rate[1]), 0.0, 1.0) 
-        long_cost += np.clip(0.25 * abs(pqr_rate[1]), 0.0, 2.0)
+        # --- 1. 基础飞行成本 (Longitudinal) ---
+        # 增加对 alt_e 的权重，并引入 vz 惩罚以抑制高度震荡
+        long_cost = (3.0 * abs(Va_e) + 10.0 * abs(pitch_e) + 2.0 * abs(alt_e) + 1.5 * abs(vz))
+        
+        # --- 2. 基础飞行成本 (Lateral) ---
+        lat_cost = (10.0 * abs(roll_e) + 15.0 * abs(delta_yaw))
 
-        # --- Lateral Cost ---
-        lat_cost = (8.0 * abs(roll_e) + 0.5 * abs(p) + 0.5 * abs(r) + 15.0 * abs(delta_yaw))
-        lat_cost += np.clip(1.0 * abs(action_rate[2]), 0.0, 1.0) 
-        lat_cost += np.clip(1.0 * abs(action_rate[3]), 0.0, 1.0) 
-        lat_cost += np.clip(0.25 * abs(pqr_rate[0]), 0.0, 2.0)
-        lat_cost += np.clip(0.25 * abs(pqr_rate[2]), 0.0, 2.0)
+        # --- 3. 稳定性与平滑性惩罚 (关键修改) ---
+        # 去掉原有的 clip，或者大幅提高上限，让网络“感受到”乱打杆的痛苦
+        smooth_penalty = 5.0 * np.sum(np.square(action_rate)) 
+        
+        # 惩罚过大的角速度绝对值 (强制平稳)
+        oscillation_penalty = 0.5 * (abs(p) + abs(q_rate) + abs(r))
 
-        # 生存法则保底
-        step_reward = 30.0 - (long_cost + lat_cost)
-        reward = max(5.0, step_reward)
+        # --- 4. 计算总奖励 ---
+        # 基础生存奖励设定为 35，减去成本
+        step_reward = 35.0 - (long_cost + lat_cost + smooth_penalty + oscillation_penalty)
+        
+        # 保证每步至少有微小正奖励，鼓励存活
+        reward = max(0.0, step_reward)
 
+        # --- 5. 终止条件与惩罚 ---
         done = False
-        terminal_penalty = -1500.0
+        terminal_penalty = -2000.0 # 提高坠毁惩罚幅度
 
-        if current_alt < 30.0 or current_alt > 100.0:
+        if current_alt < 20.0 or current_alt > 120.0: # 稍微放宽高度边界方便探索
             done = True
             reward += terminal_penalty
-        elif abs(roll) > 1.57 or abs(pitch) > 1.0: 
+        elif abs(roll) > 1.2 or abs(pitch) > 0.8: 
             done = True
             reward += terminal_penalty
-        elif Va < 12.0:
+        elif Va < 10.0: # 进一步防止失速
             done = True
             reward += terminal_penalty
 

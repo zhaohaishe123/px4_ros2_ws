@@ -2,7 +2,11 @@
 #include <stdint.h>
 #include <cmath>
 #include <string>
-
+#include <fstream>
+#include <iomanip>
+#include <chrono>
+#include <ctime>
+#include <cstdlib>
 // PX4 消息
 #include <px4_msgs/msg/offboard_control_mode.hpp>
 #include <px4_msgs/msg/vehicle_thrust_setpoint.hpp>
@@ -29,6 +33,12 @@ enum class FlightState {
 
 class OffboardActuatorManager : public rclcpp::Node {
 public:
+    // 析构函数，节点结束时安全关闭 CSV 文件
+    ~OffboardActuatorManager() {
+        if (csv_file_.is_open()) {
+            csv_file_.close();
+        }
+    }
     OffboardActuatorManager() : Node("offboard_actuator_manager") {
         // --- 发布者 ---
         offboard_control_mode_pub_ = this->create_publisher<px4_msgs::msg::OffboardControlMode>("/fmu/in/offboard_control_mode", 10);
@@ -63,6 +73,29 @@ public:
         
         last_rl_cmd_time_ = this->get_clock()->now();
         RCLCPP_INFO(this->get_logger(), "VTOL RL Manager (ROS 2) Started.");
+
+        // ==========================================
+        // [新增] 初始化 CSV 日志文件
+        // ==========================================
+        // 确保目录存在
+        system("mkdir -p ~/px4_ros2_ws/data/vtol_rl/offboard_logs");
+        
+        std::string home_dir = getenv("HOME");
+        auto now = std::chrono::system_clock::now();
+        std::time_t now_c = std::chrono::system_clock::to_time_t(now);
+        
+        std::stringstream ss;
+        ss << home_dir << "/px4_ros2_ws/data/vtol_rl/offboard_logs/offboard_cmds_" 
+           << std::put_time(std::localtime(&now_c), "%Y%m%d_%H%M%S") << ".csv";
+        
+        csv_file_.open(ss.str());
+        if (csv_file_.is_open()) {
+            // 写入 CSV 表头
+            csv_file_ << "Timestamp,State,VTOL_Type,Altitude_m,Speed_ms,Cmd_Throttle,Cmd_Elevator,Cmd_Aileron,Cmd_Rudder\n";
+            RCLCPP_INFO(this->get_logger(), "CSV Logger initialized at: %s", ss.str().c_str());
+        } else {
+            RCLCPP_ERROR(this->get_logger(), "Failed to open CSV file for logging!");
+        }
     }
 
 private:
@@ -240,13 +273,41 @@ private:
         rl_throttle_ = 0.1f + ((msg->data[0] + 1.0f) / 2.0f) * 0.9f; 
         
         // 1: Pitch Rate -> 映射到 [-1.0, 1.0] rad/s (约57度/秒)
-        rl_elevator_ = msg->data[1] * 1.0f;  
+        rl_elevator_ = msg->data[1] * 0.4f;  
         
         // 2: Roll Rate -> 映射到 [-1.5, 1.5] rad/s (约85度/秒，滚转可以快一点)
-        rl_aileron_  = msg->data[2] * 1.5f;  
+        rl_aileron_  = msg->data[2] * 0.6f;  
         
         // 3: Yaw Rate -> 映射到 [-0.5, 0.5] rad/s (方向舵微调)
-        rl_rudder_   = msg->data[3] * 0.5f;  
+        rl_rudder_   = msg->data[3] * 0.3f;  
+
+        // ==========================================
+        // [新增] 每次收到强化学习网络指令时，写入 CSV
+        // ==========================================
+        if (csv_file_.is_open()) {
+            std::string state_str = "UNKNOWN";
+            switch (flight_state_) {
+                case FlightState::INIT: state_str = "INIT"; break;
+                case FlightState::TAKEOFF: state_str = "TAKEOFF"; break;
+                case FlightState::ACCELERATE_TRANSITION: state_str = "TRANSITION"; break;
+                case FlightState::RL_TRAINING_READY: state_str = "RL_TRAINING"; break;
+                case FlightState::EMERGENCY_RTL: state_str = "EMERG_RTL"; break;
+            }
+            std::string vtol_str = (status_.vehicle_type == px4_msgs::msg::VehicleStatus::VEHICLE_TYPE_FIXED_WING) ? "FW" : "MC";   
+
+            // 写入一行数据 (保留3位小数)
+            csv_file_ << std::fixed << std::setprecision(3)
+                      << this->get_clock()->now().seconds() << ","
+                      << state_str << ","
+                      << vtol_str << ","
+                      << -local_pos_.z << ","
+                      << get_speed() << ","
+                      << rl_throttle_ << ","
+                      << rl_elevator_ << ","
+                      << rl_aileron_ << ","
+                      << rl_rudder_ << "\n";
+        }
+    
     }
 
     rclcpp::TimerBase::SharedPtr timer_;
@@ -263,6 +324,9 @@ private:
     //rclcpp::Publisher<px4_msgs::msg::VehicleTorqueSetpoint>::SharedPtr torque_pub_;
     rclcpp::Subscription<px4_msgs::msg::VtolVehicleStatus>::SharedPtr vtol_status_sub_;
     rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr rl_cmd_subscriber_;
+    // [新增] CSV 文件流对象
+    std::ofstream csv_file_;
+
 };
 
 int main(int argc, char *argv[]) {

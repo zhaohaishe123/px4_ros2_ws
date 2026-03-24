@@ -16,11 +16,11 @@ from torch.utils.tensorboard import SummaryWriter
 from envs.vtol_rl_env import VtolRlEnv
 from models.actor_critic import ActorCriticLSTM
 
-LR = 1e-4                
+LR = 3e-5                
 GAMMA = 0.995             
 EPS_CLIP = 0.2           
 K_EPOCHS = 10            
-UPDATE_TIMESTEP = 2048   
+UPDATE_TIMESTEP = 4096   
 MAX_EPISODE_STEPS = 500  
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -155,6 +155,11 @@ def main(args=None):
             current_ep_reward += reward
             time_step += 1
             
+            # ================= [新增] 1. 回合内定期输出进度 =================
+            if ep_steps % 50 == 0:
+                logger.info(f"  [Running] Ep: {i_episode+1} | Step: {ep_steps}/{MAX_EPISODE_STEPS} | Curr Reward: {current_ep_reward:.2f} | Alt: {-env.local_pos.z:.1f}m")
+            # ===============================================================
+
             if time_step % UPDATE_TIMESTEP == 0:
                 logger.info(f"Updating PPO Network at Timestep {time_step}...")
                 a_loss, c_loss = ppo_agent.update(memory)
@@ -170,8 +175,16 @@ def main(args=None):
                 break
                 
         i_episode += 1
-        logger.info(f"Episode: {i_episode} \t Reward: {current_ep_reward:.2f} \t Steps: {ep_steps}")
 
+        # ================= [修改] 2. 回合结束时的详细面板输出 =================
+        logger.info(f"==================================================")
+        logger.info(f" [Episode {i_episode} Summary] ")
+        logger.info(f"   * Total Reward : {current_ep_reward:.2f}")
+        logger.info(f"   * Ep Steps     : {ep_steps}")
+        logger.info(f"   * Total Config : {time_step} (Total Learning Steps)")
+        logger.info(f"   * Final Alt    : {-env.local_pos.z:.1f} m")
+        logger.info(f"==================================================")
+        # ===============================================================
         final_speed = state[0] * 10.0 + 20.0
         final_altitude = -env.local_pos.z 
         
