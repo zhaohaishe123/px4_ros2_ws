@@ -5,13 +5,14 @@
 
 // PX4 消息
 #include <px4_msgs/msg/offboard_control_mode.hpp>
-#include <px4_msgs/msg/actuator_motors.hpp>
-#include <px4_msgs/msg/actuator_servos.hpp>
+#include <px4_msgs/msg/vehicle_thrust_setpoint.hpp>
+#include <px4_msgs/msg/vehicle_torque_setpoint.hpp>
 #include <px4_msgs/msg/trajectory_setpoint.hpp>
 #include <px4_msgs/msg/vehicle_command.hpp>
 #include <px4_msgs/msg/vehicle_status.hpp>
 #include <px4_msgs/msg/vehicle_local_position.hpp>
 #include <px4_msgs/msg/vtol_vehicle_status.hpp>
+#include <px4_msgs/msg/vehicle_rates_setpoint.hpp>
 
 // ROS 消息
 #include <std_msgs/msg/float32_multi_array.hpp>
@@ -32,8 +33,9 @@ public:
         // --- 发布者 ---
         offboard_control_mode_pub_ = this->create_publisher<px4_msgs::msg::OffboardControlMode>("/fmu/in/offboard_control_mode", 10);
         trajectory_setpoint_pub_   = this->create_publisher<px4_msgs::msg::TrajectorySetpoint>("/fmu/in/trajectory_setpoint", 10);
-        actuator_motors_pub_       = this->create_publisher<px4_msgs::msg::ActuatorMotors>("/fmu/in/actuator_motors", 10);
-        actuator_servos_pub_       = this->create_publisher<px4_msgs::msg::ActuatorServos>("/fmu/in/actuator_servos", 10);
+        rates_pub_ = this->create_publisher<px4_msgs::msg::VehicleRatesSetpoint>("/fmu/in/vehicle_rates_setpoint", 10);
+        //thrust_pub_ = this->create_publisher<px4_msgs::msg::VehicleThrustSetpoint>("/fmu/in/vehicle_thrust_setpoint", 10);
+        //torque_pub_ = this->create_publisher<px4_msgs::msg::VehicleTorqueSetpoint>("/fmu/in/vehicle_torque_setpoint", 10);
         vehicle_command_pub_       = this->create_publisher<px4_msgs::msg::VehicleCommand>("/fmu/in/vehicle_command", 10);
 
         // --- 使用 SensorDataQoS 订阅 PX4 状态 ---
@@ -71,7 +73,8 @@ private:
     FlightState flight_state_ = FlightState::INIT;
     rclcpp::Time last_request_time_ = this->get_clock()->now();
     rclcpp::Time last_rl_cmd_time_;
-    
+
+
     bool rl_cmd_received_ = false;
     bool transition_cmd_sent_ = false;
     
@@ -134,13 +137,15 @@ private:
 
         px4_msgs::msg::OffboardControlMode ocm{};
         ocm.timestamp = timestamp_us;
-        
         if (flight_state_ == FlightState::RL_TRAINING_READY) {
             ocm.position = false;
-            ocm.actuator = true;  // PX4 1.14 使用 actuator
+            ocm.velocity = false;
+            ocm.attitude = false;
+            ocm.body_rate = true;  // <--- 开启角速度直控
+            ocm.actuator = false;         
         } else {
             ocm.position = true;
-            ocm.actuator = false;
+            ocm.body_rate = false;
         }
         offboard_control_mode_pub_->publish(ocm);
 
@@ -188,27 +193,20 @@ private:
 
             case FlightState::RL_TRAINING_READY:
                 {
-                    px4_msgs::msg::ActuatorMotors motor_msg{};
-                    px4_msgs::msg::ActuatorServos servo_msg{};
-                    motor_msg.timestamp = timestamp_us; servo_msg.timestamp = timestamp_us;
-                    for (int i = 0; i < 12; i++) motor_msg.control[i] = 0.0f;
-                    for (int i = 0; i < 8; i++) servo_msg.control[i] = 0.0f;
+                    px4_msgs::msg::VehicleRatesSetpoint rates_msg{};
+                    rates_msg.timestamp = timestamp_us;
 
-                    if (!rl_cmd_received_) {
-                        motor_msg.control[4] = 0.6f; 
-                        servo_msg.control[0] = 0.0f; servo_msg.control[1] = 0.0f; servo_msg.control[2] = 0.0f; 
-                    } else {
-                        if ((this->get_clock()->now() - last_rl_cmd_time_).seconds() > 5.0) {
-                            flight_state_ = FlightState::EMERGENCY_RTL;
-                        } else {
-                            motor_msg.control[4] = rl_throttle_;
-                            servo_msg.control[0] = rl_elevator_;
-                            servo_msg.control[1] = rl_aileron_;
-                            servo_msg.control[2] = rl_rudder_;
-                        }
-                    }
-                    actuator_motors_pub_->publish(motor_msg);
-                    actuator_servos_pub_->publish(servo_msg);
+                    // 隔离测试：写死绝对安全的固定翼飞行状态
+                    rates_msg.roll = 0.0f;   // 滚转角速度 (p) = 0
+                    rates_msg.pitch = 0.05f; // 俯仰角速度 (q) = 0.05 rad/s (微微抬头，防止掉高)
+                    rates_msg.yaw = 0.0f;    // 偏航角速度 (r) = 0
+
+                    // 固定翼的推力通常映射在 thrust_body[0] (X轴前向)
+                    rates_msg.thrust_body[0] = 0.65f; 
+                    rates_msg.thrust_body[1] = 0.0f;
+                    rates_msg.thrust_body[2] = 0.0f; 
+
+                    rates_pub_->publish(rates_msg);
                 }
                 break;
 
@@ -243,12 +241,13 @@ private:
     
     rclcpp::Publisher<px4_msgs::msg::OffboardControlMode>::SharedPtr offboard_control_mode_pub_;
     rclcpp::Publisher<px4_msgs::msg::TrajectorySetpoint>::SharedPtr trajectory_setpoint_pub_;
-    rclcpp::Publisher<px4_msgs::msg::ActuatorMotors>::SharedPtr actuator_motors_pub_;
-    rclcpp::Publisher<px4_msgs::msg::ActuatorServos>::SharedPtr actuator_servos_pub_;
     rclcpp::Publisher<px4_msgs::msg::VehicleCommand>::SharedPtr vehicle_command_pub_;
 
     rclcpp::Subscription<px4_msgs::msg::VehicleStatus>::SharedPtr vehicle_status_sub_;
     rclcpp::Subscription<px4_msgs::msg::VehicleLocalPosition>::SharedPtr local_position_sub_;
+    rclcpp::Publisher<px4_msgs::msg::VehicleRatesSetpoint>::SharedPtr rates_pub_;
+    //rclcpp::Publisher<px4_msgs::msg::VehicleThrustSetpoint>::SharedPtr thrust_pub_;
+    //rclcpp::Publisher<px4_msgs::msg::VehicleTorqueSetpoint>::SharedPtr torque_pub_;
     rclcpp::Subscription<px4_msgs::msg::VtolVehicleStatus>::SharedPtr vtol_status_sub_;
     rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr rl_cmd_subscriber_;
 };
