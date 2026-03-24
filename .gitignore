@@ -1,0 +1,26 @@
+# ROS2 编译文件
+build/
+install/
+log/
+devel/
+devel_debug/
+
+# PX4 相关
+*.autosave
+*.o
+*.elf
+*.bin
+*.px4
+*.map
+*.make
+*.cmake
+*.pyc
+__pycache__/
+
+# 系统/编辑器
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.swo
+src/px4_msgs/
