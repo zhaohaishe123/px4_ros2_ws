@@ -24,3 +24,4 @@ __pycache__/
 *.swp
 *.swo
 src/px4_msgs/
+src/px4_msgs/
