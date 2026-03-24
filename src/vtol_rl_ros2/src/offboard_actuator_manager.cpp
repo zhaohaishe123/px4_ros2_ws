@@ -196,13 +196,20 @@ private:
                     px4_msgs::msg::VehicleRatesSetpoint rates_msg{};
                     rates_msg.timestamp = timestamp_us;
 
-                    // 隔离测试：写死绝对安全的固定翼飞行状态
-                    rates_msg.roll = 0.0f;   // 滚转角速度 (p) = 0
-                    rates_msg.pitch = 0.05f; // 俯仰角速度 (q) = 0.05 rad/s (微微抬头，防止掉高)
-                    rates_msg.yaw = 0.0f;    // 偏航角速度 (r) = 0
-
-                    // 固定翼的推力通常映射在 thrust_body[0] (X轴前向)
-                    rates_msg.thrust_body[0] = 0.65f; 
+                    if (!rl_cmd_received_) {
+                        // 如果还没收到 Python 的指令，维持安全的初始滑翔姿态
+                        rates_msg.roll = 0.0f;   
+                        rates_msg.pitch = 0.05f; 
+                        rates_msg.yaw = 0.0f;    
+                        rates_msg.thrust_body[0] = 0.65f; 
+                    } else {
+                        // 【核心】：完全交由强化学习神经网络控制！
+                        rates_msg.roll = rl_aileron_;    // RL 算出的 Roll 角速度
+                        rates_msg.pitch = rl_elevator_;  // RL 算出的 Pitch 角速度
+                        rates_msg.yaw = rl_rudder_;      // RL 算出的 Yaw 角速度
+                        rates_msg.thrust_body[0] = rl_throttle_; // RL 算出的 推力
+                    }
+                    
                     rates_msg.thrust_body[1] = 0.0f;
                     rates_msg.thrust_body[2] = 0.0f; 
 
