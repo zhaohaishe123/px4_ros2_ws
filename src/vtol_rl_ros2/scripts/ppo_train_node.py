@@ -12,11 +12,12 @@ import csv
 import sys
 from datetime import datetime
 
-# 导入环境和模型
+# 导入 TensorBoard (如果提示没有模块，请终端执行 pip install tensorboard)
+from torch.utils.tensorboard import SummaryWriter
+
 from envs.vtol_rl_env import VtolRlEnv
 from models.actor_critic import ActorCriticLSTM
 
-# --- 训练超参数 ---
 LR = 1e-4                
 GAMMA = 0.995             
 EPS_CLIP = 0.2           
@@ -54,6 +55,9 @@ class PPO:
 
         states_seq = states.unsqueeze(0)
         actions_seq = actions.unsqueeze(0)
+        
+        total_actor_loss = 0
+        total_critic_loss = 0
 
         for _ in range(K_EPOCHS):
             actor_hidden = (torch.zeros(1, 1, 128).to(device), torch.zeros(1, 1, 128).to(device))
@@ -77,54 +81,60 @@ class PPO:
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
+            
+            total_actor_loss += actor_loss.item()
+            total_critic_loss += critic_loss.item()
 
         self.policy_old.load_state_dict(self.policy.state_dict())
+        
+        # 返回平均 loss 供 TensorBoard 记录
+        return total_actor_loss / K_EPOCHS, total_critic_loss / K_EPOCHS
 
 def main(args=None):
     rclpy.init(args=args)
     time_str = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    # 实例化环境
     env = VtolRlEnv()
     logger = env.node.get_logger()
     
-    # 注册 Ctrl+C 处理逻辑
+    # === [新增] 初始化日志记录路径 ===
+    base_dir = os.path.join(os.path.expanduser('~'), 'px4_ros2_ws/data/vtol_rl')
+    tb_dir = os.path.join(base_dir, f'tensorboard_logs/{time_str}')
+    save_dir = os.path.join(base_dir, 'saved_models')
+    os.makedirs(tb_dir, exist_ok=True)
+    os.makedirs(save_dir, exist_ok=True)
+
+    # 1. TensorBoard Writer
+    writer = SummaryWriter(log_dir=tb_dir)
+    
+    # 2. CSV Writer
+    csv_file_path = os.path.join(base_dir, f'training_log_{time_str}.csv')
+    csv_file = open(csv_file_path, mode='w', newline='')
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(['Episode', 'Total_Reward', 'Episode_Steps', 'Final_Altitude', 'Final_Speed'])
+    
     def signal_handler(sig, frame):
         logger.info("\n[PPO Node] Ctrl+C detected! Saving data and shutting down...")
         try:
+            writer.close()
             csv_file.close()
-        except:
-            pass
+        except: pass
         env.node.destroy_node()
         rclpy.shutdown()
         sys.exit(0)
     
     signal.signal(signal.SIGINT, signal_handler)
 
-    logger.info("Starting PPO Training Node (ROS 2 Native)...")
-
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
-    
     ppo_agent = PPO(state_dim, action_dim)
     memory = {'states': [], 'actions': [], 'logprobs': [], 'rewards': [], 'is_terminals': []}
-    
-    data_dir = os.path.join(os.path.expanduser('~'), 'px4_ros2_ws/data/vtol_rl')
-    os.makedirs(data_dir, exist_ok=True)
-    
-    csv_file_path = os.path.join(data_dir, f'training_log_{time_str}.csv')
-    csv_file = open(csv_file_path, mode='w', newline='')
-    csv_writer = csv.writer(csv_file)
-    csv_writer.writerow(['Episode', 'Total_Reward', 'Episode_Steps', 'Final_Altitude', 'Final_Speed'])
 
     time_step = 0
     i_episode = 0
-    save_dir = os.path.join(data_dir, 'saved_models')
-    os.makedirs(save_dir, exist_ok=True)
 
-    logger.info("Entering main training loop...")
+    logger.info(f"Training started. TensorBoard logs saved to: {tb_dir}")
     
-    # 使用 rclpy.ok() 替代 rospy.is_shutdown()
     while rclpy.ok():
         state = env.reset()
         actor_hidden = (torch.zeros(1, 1, 128).to(device), torch.zeros(1, 1, 128).to(device))
@@ -150,28 +160,39 @@ def main(args=None):
             current_ep_reward += reward
             time_step += 1
             
+            # 网络更新
             if time_step % UPDATE_TIMESTEP == 0:
                 logger.info(f"Updating PPO Network at Timestep {time_step}...")
-                ppo_agent.update(memory)
+                a_loss, c_loss = ppo_agent.update(memory)
                 memory = {'states': [], 'actions': [], 'logprobs': [], 'rewards': [], 'is_terminals': []}
                 
-                model_name = f'ppo_vtol_fw_{time_str}_ep{i_episode}.pth'
+                # 记录网络损失到 TensorBoard
+                writer.add_scalar('Loss/Actor', a_loss, time_step)
+                writer.add_scalar('Loss/Critic', c_loss, time_step)
+                
+                model_name = f'ppo_vtol_fw_{time_str}.pth'
                 torch.save(ppo_agent.policy.state_dict(), os.path.join(save_dir, model_name))
-                logger.info("Model saved.")
 
             if done or not rclpy.ok():
                 break
                 
         i_episode += 1
-        logger.info(f"Episode: {i_episode} \t Reward: {current_ep_reward:.2f}")
+        logger.info(f"Episode: {i_episode} \t Reward: {current_ep_reward:.2f} \t Steps: {ep_steps}")
 
         final_speed = state[0] 
-        final_altitude = -env.local_pos.z # NED coordinate
+        final_altitude = -env.local_pos.z 
         
+        # 记录每轮数据到 CSV 和 TensorBoard
         csv_writer.writerow([i_episode, current_ep_reward, ep_steps, final_altitude, final_speed])
         csv_file.flush() 
+        
+        writer.add_scalar('Episode/Total_Reward', current_ep_reward, i_episode)
+        writer.add_scalar('Episode/Steps_Survived', ep_steps, i_episode)
+        writer.add_scalar('Episode/Final_Altitude', final_altitude, i_episode)
+        writer.add_scalar('Episode/Final_Speed', final_speed, i_episode)
 
     csv_file.close()
+    writer.close()
 
 if __name__ == '__main__':
     main()

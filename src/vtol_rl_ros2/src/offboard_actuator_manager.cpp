@@ -219,22 +219,28 @@ private:
     }
 
     void rl_cmd_callback(const std_msgs::msg::Float32MultiArray::SharedPtr msg) {
-    if (msg->data.size() < 4) return;
-    
-    // 如果收到的数据里有任何一个是 NaN，直接丢弃，不更新指令
-    for (float val : msg->data) {
-        if (std::isnan(val)) return; 
-    }
+        if (msg->data.size() < 4) return;
+        
+        for (float val : msg->data) {
+            if (std::isnan(val)) return; 
+        }
 
-    rl_cmd_received_ = true;
-    last_rl_cmd_time_ = this->get_clock()->now();
-    
-    // 映射与赋值
-    rl_throttle_ = (msg->data[0] + 1.0f) / 2.0f; 
-    rl_elevator_ = msg->data[1];
-    rl_aileron_  = msg->data[2];
-    rl_rudder_   = msg->data[3];
-}
+        rl_cmd_received_ = true;
+        last_rl_cmd_time_ = this->get_clock()->now();
+        
+        // 动作空间映射 (Action Mapping)
+        // 0: Throttle -> 映射到 [0.1, 1.0] (保证最小空速)
+        rl_throttle_ = 0.1f + ((msg->data[0] + 1.0f) / 2.0f) * 0.9f; 
+        
+        // 1: Pitch Rate -> 映射到 [-1.0, 1.0] rad/s (约57度/秒)
+        rl_elevator_ = msg->data[1] * 1.0f;  
+        
+        // 2: Roll Rate -> 映射到 [-1.5, 1.5] rad/s (约85度/秒，滚转可以快一点)
+        rl_aileron_  = msg->data[2] * 1.5f;  
+        
+        // 3: Yaw Rate -> 映射到 [-0.5, 0.5] rad/s (方向舵微调)
+        rl_rudder_   = msg->data[3] * 0.5f;  
+    }
 
     rclcpp::TimerBase::SharedPtr timer_;
     rclcpp::TimerBase::SharedPtr logging_timer_; // 新增定时器
