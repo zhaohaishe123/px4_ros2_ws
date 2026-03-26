@@ -17,7 +17,7 @@
 #include <px4_msgs/msg/vehicle_local_position.hpp>
 #include <px4_msgs/msg/vtol_vehicle_status.hpp>
 #include <px4_msgs/msg/vehicle_rates_setpoint.hpp>
-
+#include <std_msgs/msg/bool.hpp>
 // ROS 消息
 #include <std_msgs/msg/float32_multi_array.hpp>
 
@@ -47,6 +47,8 @@ public:
         //thrust_pub_ = this->create_publisher<px4_msgs::msg::VehicleThrustSetpoint>("/fmu/in/vehicle_thrust_setpoint", 10);
         //torque_pub_ = this->create_publisher<px4_msgs::msg::VehicleTorqueSetpoint>("/fmu/in/vehicle_torque_setpoint", 10);
         vehicle_command_pub_       = this->create_publisher<px4_msgs::msg::VehicleCommand>("/fmu/in/vehicle_command", 10);
+        // [新增] 初始化状态位发布者
+        ready_pub_ = this->create_publisher<std_msgs::msg::Bool>("/rl/training_ready", 10);
 
         // --- 使用 SensorDataQoS 订阅 PX4 状态 ---
         rclcpp::QoS qos_profile = rclcpp::SensorDataQoS();
@@ -184,7 +186,7 @@ private:
 
         px4_msgs::msg::TrajectorySetpoint sp{};
         sp.timestamp = timestamp_us; sp.yaw = 0.0f; 
-        float flight_altitude_ned = -30.0f; 
+        float flight_altitude_ned = -50.0f; 
 
         switch (flight_state_) {
             case FlightState::INIT:
@@ -256,6 +258,13 @@ private:
                 }
                 break;
         }
+        // ==========================================
+        // [新增] 向外广播 RL 是否可以接管的状态位
+        // ==========================================
+        std_msgs::msg::Bool ready_msg;
+        // 只有当 C++ 节点的状态机正式进入 RL_TRAINING_READY 阶段时，才输出 True
+        ready_msg.data = (flight_state_ == FlightState::RL_TRAINING_READY);
+        ready_pub_->publish(ready_msg);
     }
 
     void rl_cmd_callback(const std_msgs::msg::Float32MultiArray::SharedPtr msg) {
@@ -324,6 +333,7 @@ private:
     //rclcpp::Publisher<px4_msgs::msg::VehicleTorqueSetpoint>::SharedPtr torque_pub_;
     rclcpp::Subscription<px4_msgs::msg::VtolVehicleStatus>::SharedPtr vtol_status_sub_;
     rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr rl_cmd_subscriber_;
+    rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr ready_pub_; // [新增] 状态位发布者
     // [新增] CSV 文件流对象
     std::ofstream csv_file_;
 

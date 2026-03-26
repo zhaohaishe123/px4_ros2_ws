@@ -14,24 +14,65 @@ from datetime import datetime
 from torch.utils.tensorboard import SummaryWriter
 
 from envs.vtol_rl_env import VtolRlEnv
-from models.actor_critic import ActorCriticLSTM
+from models.actor_critic import ActorCriticTCN
 
 LR = 3e-5                
 GAMMA = 0.995             
 EPS_CLIP = 0.2           
 K_EPOCHS = 10            
-UPDATE_TIMESTEP = 4096   
+UPDATE_TIMESTEP = 2048   
 MAX_EPISODE_STEPS = 500  
+SEQ_LEN = 8    # [新增] 时间序列窗口长度
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class PPO:
     def __init__(self, state_dim, action_dim):
-        self.policy = ActorCriticLSTM(state_dim, action_dim).to(device)
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=LR) 
-        self.policy_old = ActorCriticLSTM(state_dim, action_dim).to(device)
+        self.policy = ActorCriticTCN(state_dim, action_dim, seq_len=SEQ_LEN).to(device)
+        
+        # 定义权重文件路径
+        import os
+        base_dir = os.path.expanduser('~/px4_ros2_ws/data/vtol_rl/saved_models')
+        ppo_resume_path = os.path.join(base_dir, 'ppo_vtol_resume.pth')
+        expert_pretrained_path = os.path.join(base_dir, 'pretrained_tcn.pth')
+
+        # ================= [修改核心] 权重加载优先级策略 =================
+        if os.path.exists(ppo_resume_path):
+            # 1. 优先加载 PPO 断点
+            # 这里 strict=True，且不需要重新设置噪音方差，因为断点里已经保存了完整的 Actor 和 Critic 状态
+            self.policy.load_state_dict(torch.load(ppo_resume_path))
+            print(f"\n[INFO] 发现 PPO 断点，正在无缝恢复训练: {ppo_resume_path}\n")
+            
+        elif os.path.exists(expert_pretrained_path):
+            # 2. 如果没有 PPO 断点，则加载预训练的专家大脑
+            self.policy.load_state_dict(torch.load(expert_pretrained_path), strict=False)
+            print(f"\n[SUCCESS] 成功加载预训练专家权重: {expert_pretrained_path}\n")
+            
+            # 仅在初始加载专家权重时，强行压缩巨大的初始探索噪音
+            with torch.no_grad():
+                self.policy.actor_log_std.fill_(-2.5)
+                
+        else:
+            # 3. 啥都没有，从零开始瞎飞
+            print(f"\n[WARNING] 未找到任何权重，将从零开始随机探索！\n")
+        # ================================================================
+
+        # 分离学习率：Actor极小(保护记忆)，Critic较大(快速学打分)
+        CRITIC_LR = 1e-3
+        ACTOR_LR = 5e-6 
+        
+        self.optimizer = optim.Adam([
+            {'params': self.policy.critic_tcn.parameters(), 'lr': CRITIC_LR},
+            {'params': self.policy.critic_mlp.parameters(), 'lr': CRITIC_LR},
+            {'params': self.policy.actor_tcn.parameters(), 'lr': ACTOR_LR},
+            {'params': self.policy.actor_mlp.parameters(), 'lr': ACTOR_LR},
+            {'params': self.policy.actor_log_std, 'lr': ACTOR_LR}
+        ])
+        
+        self.policy_old = ActorCriticTCN(state_dim, action_dim, seq_len=SEQ_LEN).to(device)
         self.policy_old.load_state_dict(self.policy.state_dict())
-        self.MseLoss = nn.MSELoss() 
+        
+        self.MseLoss = nn.MSELoss()
 
     def update(self, memory):
         states = torch.stack(memory['states']).to(device).detach()
@@ -127,17 +168,29 @@ def main(args=None):
     logger.info("Entering main training loop...")
     
     while rclpy.ok():
+        try:
+            state = env.reset()
+        except RuntimeError as e:
+            logger.fatal(f"Environment Error: {e}. Shutting down cleanly for Bash restart...")
+            break  # 优雅跳出循环，执行文件末尾的销毁流程
+
+        
         state = env.reset()
-        actor_hidden = (torch.zeros(1, 1, 128).to(device), torch.zeros(1, 1, 128).to(device))
         current_ep_reward, ep_steps = 0, 0 
         
+        # ================= [新增] 初始化状态历史序列 =================
+        # 使用初始状态填满过去的 8 帧窗口
+        state_tensor = torch.FloatTensor(state).to(device)
+        state_history = state_tensor.unsqueeze(0).repeat(SEQ_LEN, 1) 
+        # ============================================================
+        
         for t in range(MAX_EPISODE_STEPS):
-            state_tensor = torch.FloatTensor(state).to(device)
             with torch.no_grad():
-                action, action_logprob, actor_hidden = ppo_agent.policy_old.act(state_tensor, actor_hidden)
+                # [修改] 现在传入的是 (8, 17) 的历史状态张量
+                action, action_logprob, _ = ppo_agent.policy_old.act(state_history)
             action_np = action.cpu().numpy()
             
-            # 从归一化状态还原实际角度记录
+            # ... (保留你原有的 CSV 记录代码) ...
             curr_roll, curr_pitch, curr_yaw = state[1]*1.57, state[2]*1.0, env.prev_yaw
             tgt_roll, tgt_pitch = state[14], state[15]
             flight_csv_writer.writerow([i_episode, ep_steps, curr_roll, curr_pitch, curr_yaw, tgt_roll, tgt_pitch, action_np[0], action_np[1], action_np[2], action_np[3]])
@@ -145,20 +198,28 @@ def main(args=None):
             next_state, reward, done, _ = env.step(action_np)
             
             ep_steps += 1
-            memory['states'].append(state_tensor)
+            
+            # [修改] 存入 memory 的必须是克隆的 state_history
+            memory['states'].append(state_history.clone())
             memory['actions'].append(action)
             memory['logprobs'].append(action_logprob)
             memory['rewards'].append(reward)
             memory['is_terminals'].append(done)
             
+            # ================= [新增] 状态滑窗更新 =================
+            # 将最旧的 1 帧挤出去，将新的 next_state 填入末尾
+            next_state_tensor = torch.FloatTensor(next_state).to(device)
+            state_history = torch.roll(state_history, shifts=-1, dims=0)
+            state_history[-1] = next_state_tensor
+            # =======================================================
+            
             state = next_state
             current_ep_reward += reward
             time_step += 1
             
-            # ================= [新增] 1. 回合内定期输出进度 =================
+            # ... (保留原有的打印和更新逻辑) ...
             if ep_steps % 50 == 0:
                 logger.info(f"  [Running] Ep: {i_episode+1} | Step: {ep_steps}/{MAX_EPISODE_STEPS} | Curr Reward: {current_ep_reward:.2f} | Alt: {-env.local_pos.z:.1f}m")
-            # ===============================================================
 
             if time_step % UPDATE_TIMESTEP == 0:
                 logger.info(f"Updating PPO Network at Timestep {time_step}...")
@@ -167,7 +228,6 @@ def main(args=None):
                 
                 writer.add_scalar('Loss/Actor', a_loss, time_step)
                 writer.add_scalar('Loss/Critic', c_loss, time_step)
-                # 移除了此处的 writer.flush()
 
                 torch.save(ppo_agent.policy.state_dict(), os.path.join(base_dir, f'saved_models/ppo_vtol_fw_{time_str}.pth'))
 

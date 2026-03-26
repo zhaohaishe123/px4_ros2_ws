@@ -10,6 +10,7 @@ import numpy as np
 import math
 import time
 
+from std_msgs.msg import Float32MultiArray, Bool
 from std_msgs.msg import Float32MultiArray
 from px4_msgs.msg import VehicleLocalPosition, VehicleAttitude, VehicleAngularVelocity, SensorCombined, VehicleStatus
 
@@ -51,43 +52,90 @@ class VtolRlEnv(gym.Env):
         self.prev_action = np.zeros(4)
         self.prev_pqr = np.zeros(3)
 
-    def _spin_once(self): rclpy.spin_once(self.node, timeout_sec=0.01)
+        # 等待系统就绪机制
+        self.node.get_logger().info("Waiting for PX4 DDS connection and Offboard take-off...")
+        while rclpy.ok():
+            self._spin_once()
+            # 必须满足三个条件：1.收到状态 2.处于解锁状态 3.高度大于10米(说明C++节点已经把它带飞起来了)
+            if hasattr(self, 'status') and self.status.arming_state == VehicleStatus.ARMING_STATE_ARMED:
+                if hasattr(self, 'local_pos') and -self.local_pos.z > 10.0:
+                    self.node.get_logger().info("PX4 is Airborne and Ready! Starting RL...")
+                    break
+            time.sleep(0.5)
+
+        # 专门用于接收 C++ 节点状态位的变量
+        self.is_offboard_ready = False
+        self.node.create_subscription(Bool, '/rl/training_ready', self._ready_cb, qos_profile)
+
+        self.target_speed = 20.0
+        self.target_roll = 0.0
+        self.target_pitch = 0.05  
+        self.target_altitude = 50.0 
+        
+        self.prev_yaw = 0.0
+        self.prev_action = np.zeros(4)
+        self.prev_pqr = np.zeros(3)
+
+        # 基于状态位的就绪等待机制
+        self.node.get_logger().info("Waiting for C++ Offboard Node to complete take-off and transition...")
+        while rclpy.ok():
+            self._spin_once()
+            
+            # 只要收到 C++ 节点的 True 信号，直接跳出死等，开始强化学习
+            if self.is_offboard_ready:
+                self.node.get_logger().info("Received READY signal from C++ node. Starting RL Training!")
+                break
+                
+            time.sleep(0.5)
+
+
+    # 状态位回调函数
+    def _ready_cb(self, msg):
+        self.is_offboard_ready = msg.data
+
+    def _spin_once(self): 
+        rclpy.spin_once(self.node, timeout_sec=0.01)
 
     def step(self, action):
-        # ================= [新增] 飞行姿态安全保护罩 (Attitude Safety Guard) =================
-        # 1. 获取当前真实的 Roll 和 Pitch 姿态角
+        # ================= 1. 获取当前真实的姿态角 =================
         w, x, y, z = self.att.q[0], self.att.q[1], self.att.q[2], self.att.q[3]
         roll = math.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
         pitch = math.asin(2.0 * (w * y - z * x))
 
-        # 2. 定义安全边界 (弧度)
-        SAFE_PITCH = 0.5  # 约 28 度 (防止严重抬机头/大角度俯冲)
-        SAFE_ROLL  = 0.8  # 约 45 度 (防止过度倾斜导致掉高甚至翻滚)
+        # ================= 2. 保守的“限舵”操作 (事前限制) =================
+        # 即使 C++ 会做物理映射，我们也必须在这里将 RL 的输出 [-1, 1] 压制在更小的安全范围内。
+        # 绝不能让网络在初期有机会输出满舵导致飞机不可逆翻滚。
+        safe_action = np.copy(action)
+        safe_action[0] = np.clip(action[0], -0.5, 0.5)  # 限制油门剧烈波动
+        safe_action[1] = np.clip(action[1], -0.4, 0.4)  # 限制俯仰幅度 (防止猛扎机头)
+        safe_action[2] = np.clip(action[2], -0.5, 0.5)  # 限制横滚幅度 (防止翻滚)
+        safe_action[3] = np.clip(action[3], -0.2, 0.2)  # 限制偏航幅度
 
-        # 3. 拦截危险指令：如果已经在危险边缘，且 RL 动作还要继续加剧倾斜，则强行切断该方向指令
-        if (pitch > SAFE_PITCH and action[1] > 0.0) or (pitch < -SAFE_PITCH and action[1] < 0.0):
-            action[1] = 0.0
-        if (roll > SAFE_ROLL and action[2] > 0.0) or (roll < -SAFE_ROLL and action[2] < 0.0):
-            action[2] = 0.0
+        # ================= 3. 强硬的姿态电子围栏 (事后接管) =================
+        # 收紧安全边界：超过 23度(Pitch) 或 34度(Roll) 直接剥夺 RL 控制权
+        SAFE_PITCH = 0.4  
+        SAFE_ROLL  = 0.6  
 
-        # 4. 强力改平辅助：如果由于惯性越过了极限安全线，脱离 RL 控制，直接施加反向恢复力矩
-        if pitch > SAFE_PITCH + 0.1:
-            action[1] = -0.6  # 强制压机头
-        elif pitch < -(SAFE_PITCH + 0.1):
-            action[1] = 0.6   # 强制拉机头
+        # 俯仰越界：强制拉回
+        if pitch > SAFE_PITCH:     
+            safe_action[1] = -0.8  # 强制压机头
+        elif pitch < -SAFE_PITCH:
+            safe_action[1] = 0.8   # 强制拉机头
+            safe_action[0] = 0.8   # 拉机头时强制增加油门，防止失速坠落
 
-        if roll > SAFE_ROLL + 0.1:
-            action[2] = -0.8  # 强制反向横滚改平
-        elif roll < -(SAFE_ROLL + 0.1):
-            action[2] = 0.8
-        # =================================================================================
+        # 横滚越界：防止倾翻的核心
+        if roll > SAFE_ROLL:       
+            safe_action[2] = -1.0  # 直接打满反舵：强制强力左滚转改平
+        elif roll < -SAFE_ROLL:  
+            safe_action[2] = 1.0   # 直接打满反舵：强制强力右滚转改平
 
-        # 动作平滑 (融入了安全修正后的 action)
+        # ================= 4. 动作平滑与下发 =================
+        # 使用经过安全过滤的 safe_action 进行平滑计算和下发
         tau = 0.4
-        smoothed_action = (1.0 - tau) * self.prev_action + tau * action
+        smoothed_action = (1.0 - tau) * self.prev_action + tau * safe_action
         smoothed_action = np.clip(smoothed_action, -1.0, 1.0)
 
-        # 发送给 C++ 节点 (C++中会映射为具体的物理边界)
+        # 发送给 C++ 节点
         msg = Float32MultiArray()
         msg.data = smoothed_action.tolist()
         self.cmd_pub.publish(msg)
@@ -96,31 +144,60 @@ class VtolRlEnv(gym.Env):
         self._spin_once()
         
         obs = self._get_obs()
-        reward, done = self._compute_reward_and_done(obs, smoothed_action)
+        
+        # ================= 5. 奖励评估 =================
+        # 【关键】：计算奖励时，必须传入网络最初始、最真实的 `action`，而不是 `smoothed_action`！
+        # 这样网络才会因为输出满舵而在 _compute_reward_and_done 的平滑性惩罚中被严重扣分，
+        # 从而学到“我乱打杆虽然没死（因为有保护），但是分数很惨”。
+        reward, done = self._compute_reward_and_done(obs, action)
 
         self.prev_action = np.copy(smoothed_action)
         self.prev_pqr = obs[4:7]
 
         return obs, reward, done, {}
-
+    
     def reset(self):
-        """超限恢复逻辑：使用角速度P控制器"""
+        """优化版超限恢复逻辑：防死锁与失速改出"""
         self.prev_yaw = 0.0
         self.prev_action = np.zeros(4)
         self.prev_pqr = np.zeros(3)
 
         self._spin_once()
         obs = self._get_obs()
-        current_alt = -self.local_pos.z # NED转为正高度
-        speed = obs[0]
+        current_alt = -self.local_pos.z 
+        speed = obs[0] * 10.0 + 20.0 # 还原实际速度
 
+        # 如果已经很完美，直接开始
         if 48.0 < current_alt < 52.0 and 17.0 < speed < 22.0:
             return obs
 
-        self.node.get_logger().info(f"Out of bounds! Alt: {current_alt:.1f}m, Speed: {speed:.1f}m/s. Initiating active Body Rate recovery...")
+        self.node.get_logger().info(f"Out of bounds! Alt: {current_alt:.1f}m, Speed: {speed:.1f}m/s. Initiating active recovery...")
+        
+        start_time = time.time()
         
         while rclpy.ok():
             self._spin_once()
+            
+            # ================= [终极修复：不死节点机制] =================
+            if time.time() - start_time > 30.0 or -self.local_pos.z < 5.0:
+                self.node.get_logger().warn("⚠️ Recovery failed (Crashed)! Waiting for C++ Auto-Respawn...")
+                
+                # 1. 强行将就绪标志位置为 False，切断控制权
+                self.is_offboard_ready = False
+                
+                # 2. 挂起 Python 节点，死等 C++ 重新起飞并发布 READY
+                while rclpy.ok():
+                    self._spin_once()
+                    if self.is_offboard_ready:
+                        self.node.get_logger().info("PX4 is Airborne again! Resuming recovery...")
+                        break
+                    time.sleep(0.5)
+                
+                # 3. 飞机重新起飞后，重置超时计时器，继续执行恢复逼近逻辑
+                start_time = time.time()
+                continue
+            # =========================================================
+
             if self.status.arming_state != VehicleStatus.ARMING_STATE_ARMED:
                 time.sleep(1.0)
                 continue
@@ -129,20 +206,24 @@ class VtolRlEnv(gym.Env):
             check_speed = np.sqrt(self.local_pos.vx**2 + self.local_pos.vy**2 + self.local_pos.vz**2)
             roll, pitch, yaw = euler_from_quaternion(self.att.q)
 
-            if 48.5 < check_alt < 51.5 and 18.5 < check_speed < 21.5 and abs(roll) < 0.1:
+            if 48.0 < check_alt < 52.0 and 18.0 < check_speed < 22.0 and abs(roll) < 0.15:
                 self.node.get_logger().info("Recovery successful! Starting new episode...")
                 break
 
-            # --- 角速度 P 控制器 ---
-            alt_err = 50.0 - check_alt
-            speed_err = 20.0 - check_speed
-            
-            # 1. Pitch Rate (NED: 正值抬头)
-            cmd_pitch_rate = np.clip(alt_err * 0.1, -0.6, 0.6) 
-            # 2. Roll Rate (反向打杆以改平)
-            cmd_roll_rate = np.clip(-roll * 2.0, -1.0, 1.0)
-            # 3. Throttle (映射到 [-1, 1])
-            cmd_throttle = np.clip(0.0 + (speed_err * 0.15) + (alt_err * 0.02), -0.5, 1.0)
+            # --- 智能分段 P 控制器 ---
+            # [新增] 失速改出逻辑：如果速度太低，不要管高度，强行推机头加速！
+            if check_speed < 12.0:
+                cmd_throttle = 1.0       # 满油门
+                cmd_pitch_rate = -0.5    # 强制压机头俯冲增速
+                cmd_roll_rate = np.clip(-roll * 2.0, -1.0, 1.0) # 尽量改平横滚
+            else:
+                # 速度正常后，再去追高度
+                alt_err = 50.0 - check_alt
+                speed_err = 20.0 - check_speed
+                
+                cmd_pitch_rate = np.clip(alt_err * 0.1, -0.6, 0.6) 
+                cmd_roll_rate = np.clip(-roll * 2.0, -1.0, 1.0)
+                cmd_throttle = np.clip(0.6 + (speed_err * 0.1) + (alt_err * 0.02), 0.1, 1.0)
             
             rec_action = np.array([cmd_throttle, cmd_pitch_rate, cmd_roll_rate, 0.0], dtype=np.float32)
             msg = Float32MultiArray()
@@ -187,18 +268,16 @@ class VtolRlEnv(gym.Env):
         ], dtype=np.float32)
 
         return obs
-
     def _compute_reward_and_done(self, obs, action):
-        """优化版奖励函数：强化平滑性约束与震荡抑制"""
-        # 解包状态 (按照 _get_obs 的组装顺序)
-        # Va[0], roll[1], pitch[2], delta_yaw[3], p[4], q[5], r[6]
+        """优化版奖励函数：根治死亡俯冲，彻底阻断自杀策略"""
+        # 解包状态
         Va = obs[0] * 10.0 + 20.0
         roll = obs[1] * 1.57
         pitch = obs[2] * 1.0
         delta_yaw = obs[3] * 3.14
         p, q_rate, r = obs[4] * 2.0, obs[5] * 2.0, obs[6] * 2.0
         
-        # 垂直速度 (从 local_pos 获取，用于抑制震荡)
+        # 垂直速度 (NED坐标系：vz > 0 表示正在下降)
         vz = self.local_pos.vz 
         current_alt = -self.local_pos.z
         
@@ -210,39 +289,45 @@ class VtolRlEnv(gym.Env):
 
         # 动作变化率 (惩罚抖动)
         action_rate = action - self.prev_action 
-
+        
+        # ================= [死亡俯冲专项惩罚] =================
+        dive_penalty = 0.0
+        if vz > 3.0 and pitch < -0.2: 
+            dive_penalty = 20.0 * vz 
+        
         # --- 1. 基础飞行成本 (Longitudinal) ---
-        # 增加对 alt_e 的权重，并引入 vz 惩罚以抑制高度震荡
-        long_cost = (3.0 * abs(Va_e) + 10.0 * abs(pitch_e) + 2.0 * abs(alt_e) + 1.5 * abs(vz))
+        long_cost = (2.0 * abs(Va_e) + 15.0 * abs(pitch_e) + 3.0 * abs(alt_e) + 2.0 * abs(vz))
         
         # --- 2. 基础飞行成本 (Lateral) ---
-        lat_cost = (10.0 * abs(roll_e) + 15.0 * abs(delta_yaw))
+        lat_cost = (15.0 * abs(roll_e) + 10.0 * abs(delta_yaw))
 
-        # --- 3. 稳定性与平滑性惩罚 (关键修改) ---
-        # 去掉原有的 clip，或者大幅提高上限，让网络“感受到”乱打杆的痛苦
+        # --- 3. 稳定性与平滑性惩罚 ---
         smooth_penalty = 5.0 * np.sum(np.square(action_rate)) 
-        
-        # 惩罚过大的角速度绝对值 (强制平稳)
         oscillation_penalty = 0.5 * (abs(p) + abs(q_rate) + abs(r))
 
         # --- 4. 计算总奖励 ---
-        # 基础生存奖励设定为 35，减去成本
-        step_reward = 35.0 - (long_cost + lat_cost + smooth_penalty + oscillation_penalty)
+        step_reward = 40.0 - (long_cost + lat_cost + smooth_penalty + oscillation_penalty + dive_penalty)
         
-        # 保证每步至少有微小正奖励，鼓励存活
-        reward = max(0.0, step_reward)
+        # ================= [核心修复：截断负分底线] =================
+        # 允许出现负分来惩罚颠簸，但单步最多扣 -20 分。
+        # 这样即使活满 500 步，最差总分也就是 -10000 分左右。
+        reward = np.clip(step_reward, -20.0, 50.0)
 
         # --- 5. 终止条件与惩罚 ---
         done = False
-        terminal_penalty = -2000.0 # 提高坠毁惩罚幅度
+        
+        # ================= [核心修复：深渊级坠毁惩罚] =================
+        # 坠毁惩罚必须远大于最差存活总分（-10000），让它永远不敢自杀
+        terminal_penalty = -30000.0 
 
-        if current_alt < 20.0 or current_alt > 120.0: # 稍微放宽高度边界方便探索
+        # 维持之前修改的 30.0 米生命线
+        if current_alt < 30.0 or current_alt > 120.0: 
             done = True
             reward += terminal_penalty
         elif abs(roll) > 1.2 or abs(pitch) > 0.8: 
             done = True
             reward += terminal_penalty
-        elif Va < 10.0: # 进一步防止失速
+        elif Va < 10.0: 
             done = True
             reward += terminal_penalty
 
